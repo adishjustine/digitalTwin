@@ -1,248 +1,322 @@
-"""
-Digital Twin — Smart Building Energy Efficiency Demo
-------------------------------------------------------
+"""DT-BEMS dashboard: conventional BEMS vs digital-twin MPC BEMS.
+
 Run with:
     pip install -r requirements.txt
     streamlit run app.py
 
-Shows a live-updating Digital Twin of a 3-zone building that predicts
-temperature/occupancy trends and compares energy use under a
-conventional reactive BEMS vs a predictive Digital-Twin BEMS (DT-BEMS).
+All results are modelled with illustrative parameters. They are not
+measurements of a real building.
 """
+import dataclasses
 
-import time
-import random
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# --------------------------------------------------------------------
-# Config / constants
-# --------------------------------------------------------------------
-ZONES = ["Zone A - Lobby", "Zone B - Offices", "Zone C - Server Room"]
-SETPOINTS = {ZONES[0]: 24.0, ZONES[1]: 23.0, ZONES[2]: 20.0}
-HVAC_MAX_KW = {ZONES[0]: 2.5, ZONES[1]: 3.0, ZONES[2]: 4.0}
-LIGHT_KW = {ZONES[0]: 0.4, ZONES[1]: 0.6, ZONES[2]: 0.1}
-CO2_FACTOR = 0.82        # kg CO2 per kWh (India grid avg, approx)
-STEP_MINUTES = 5         # each simulated "tick" = 5 minutes
+from models.building import default_zones
+from models.digital_twin import DigitalTwin
+from models.energy import CO2_FACTOR, DEFAULT_TARIFF
+from simulation.controllers import DTController
+from simulation.scenarios import SCENARIOS
+from simulation.simulator import compare
 
-st.set_page_config(page_title="Digital Twin — Smart Building", layout="wide")
+st.set_page_config(page_title="DT-BEMS Dashboard", layout="wide")
 
-# --------------------------------------------------------------------
-# Session state init
-# --------------------------------------------------------------------
-def init_state():
-    if "history" not in st.session_state:
-        st.session_state.history = []
-    if "t" not in st.session_state:
-        st.session_state.t = 0
-    if "zone_temp" not in st.session_state:
-        st.session_state.zone_temp = {z: SETPOINTS[z] + random.uniform(-1, 2) for z in ZONES}
-    if "zone_occ" not in st.session_state:
-        st.session_state.zone_occ = {z: random.randint(0, 15) for z in ZONES}
-    if "humidity" not in st.session_state:
-        st.session_state.humidity = 55.0
-    if "prev_temp" not in st.session_state:
-        st.session_state.prev_temp = dict(st.session_state.zone_temp)
-    if "kwh_normal" not in st.session_state:
-        st.session_state.kwh_normal = 0.0
-    if "kwh_dt" not in st.session_state:
-        st.session_state.kwh_dt = 0.0
-    if "running" not in st.session_state:
-        st.session_state.running = False
+ZONES = default_zones()
+ZN = [z.name for z in ZONES]
+C_BASE, C_DT = "#E07B00", "#1F77B4"   # orange = conventional, blue = digital twin
+INTERVAL = 5
 
-init_state()
+# --------------------------------------------------------------------------
+# State + presets
+# --------------------------------------------------------------------------
+DEFAULTS = {"scenario": "Normal day", "out_off": 0.0, "start_off": 0.0,
+            "m0": 1.0, "m1": 1.0, "m2": 1.0, "horizon": 30,
+            "tariff": float(DEFAULT_TARIFF)}
+for _k, _v in DEFAULTS.items():
+    st.session_state.setdefault(_k, _v)
 
-# --------------------------------------------------------------------
-# Sidebar controls
-# --------------------------------------------------------------------
-st.sidebar.title("⚙️ Controls")
-outside_temp = st.sidebar.slider("Outside temperature (°C)", 15.0, 42.0, 30.0, 0.5)
-price = st.sidebar.number_input("Electricity price (₹/kWh)", 1.0, 20.0, 8.0, 0.5)
-occ_boost = st.sidebar.slider("Occupancy trend bias (people)", -10, 10, 0)
-speed = st.sidebar.slider("Sim speed (sec/tick)", 0.2, 3.0, 1.0, 0.1)
 
-col_run1, col_run2 = st.sidebar.columns(2)
-if col_run1.button("▶ Run"):
-    st.session_state.running = True
-if col_run2.button("⏸ Pause"):
-    st.session_state.running = False
-if st.sidebar.button("🔄 Reset simulation"):
-    for k in ["history", "t", "zone_temp", "zone_occ", "humidity",
-              "prev_temp", "kwh_normal", "kwh_dt", "running"]:
-        del st.session_state[k]
-    init_state()
-    st.rerun()
+def preset(**kw):
+    st.session_state.update(kw)
 
-active_mode = st.sidebar.radio("Active BEMS (controls the building)",
-                                ["Normal BEMS", "DT-BEMS"], index=1)
 
-st.sidebar.caption(f"Simulated step = {STEP_MINUTES} min | t = {st.session_state.t} steps")
+# --------------------------------------------------------------------------
+# Cached simulation runs
+# --------------------------------------------------------------------------
+@st.cache_data(show_spinner="Running both controllers on the same scenario...")
+def run_scenario(name, out_off, start_off, mults, horizon):
+    s = SCENARIOS[name]()
+    occ = np.rint(s.occ * np.array(mults)[:, None]).astype(int)
+    s = dataclasses.replace(
+        s, t_out=s.t_out + out_off, occ=occ,
+        init_temps=[t + start_off for t in s.init_temps])
+    return s, compare(s, dt=DTController(horizon=horizon))
 
-# --------------------------------------------------------------------
-# One simulation tick
-# --------------------------------------------------------------------
-def step():
-    s = st.session_state
-    s.prev_temp = dict(s.zone_temp)
 
-    # humidity random walk
-    s.humidity = float(np.clip(s.humidity + random.uniform(-2, 2), 30, 85))
-
-    zone_rows = []
-    total_normal_kw = 0.0
-    total_dt_kw = 0.0
-
-    for z in ZONES:
-        # occupancy random walk, biased by sidebar control
-        occ = s.zone_occ[z] + random.randint(-2, 2) + (1 if occ_boost > 0 and random.random() < 0.3 else 0) \
-              - (1 if occ_boost < 0 and random.random() < 0.3 else 0)
-        occ = int(np.clip(occ, 0, 30))
-        s.zone_occ[z] = occ
-
-        # temperature drifts toward outside temp + occupant heat gain
-        temp = s.zone_temp[z] + 0.15 * (outside_temp - s.zone_temp[z]) + occ * 0.02 + random.uniform(-0.2, 0.2)
-        setpoint = SETPOINTS[z]
-        max_kw = HVAC_MAX_KW[z]
-
-        # --- Digital twin prediction (simple trend extrapolation) ---
-        trend = temp - s.prev_temp[z]
-        predicted_temp = temp + trend * 3  # look 3 steps ahead
-
-        # --- Normal BEMS: reactive bang-bang on current temp only ---
-        diff_now = temp - setpoint
-        if diff_now > 1.5:
-            hvac_normal = max_kw
-        elif diff_now > 0.5:
-            hvac_normal = max_kw * 0.5
-        else:
-            hvac_normal = max_kw * 0.15
-        light_normal = LIGHT_KW[z] if occ > 0 else 0.0
-
-        # --- DT-BEMS: predictive + occupancy aware ---
-        diff_pred = predicted_temp - setpoint
-        if occ == 0:
-            hvac_dt = max_kw * 0.05          # setback when empty
-        elif diff_pred > 1.5:
-            hvac_dt = max_kw * 0.55          # gentle pre-cool, avoids overshoot spike
-        elif diff_pred > 0.5:
-            hvac_dt = max_kw * 0.30
-        else:
-            hvac_dt = max_kw * 0.10
-        light_dt = LIGHT_KW[z] * min(1.0, occ / 10) if occ > 0 else 0.0
-
-        # apply HVAC correction to the *actual* temp if this zone's mode is active
-        correction_kw = hvac_normal if active_mode == "Normal BEMS" else hvac_dt
-        temp -= (correction_kw / max_kw) * 0.6  # cooling effect proportional to power applied
-        s.zone_temp[z] = float(temp)
-
-        total_normal_kw += hvac_normal + light_normal
-        total_dt_kw += hvac_dt + light_dt
-
-        zone_rows.append({
-            "zone": z, "temp": round(temp, 2), "occupancy": occ,
-            "predicted_temp": round(predicted_temp, 2),
-            "hvac_normal": round(hvac_normal, 2), "hvac_dt": round(hvac_dt, 2),
+@st.cache_data(show_spinner="Running all five scenarios...")
+def run_all(horizon):
+    rows = []
+    for name, build in SCENARIOS.items():
+        r = compare(build(), dt=DTController(horizon=horizon))
+        b, d = r["baseline"].summary, r["dt"].summary
+        rows.append({
+            "Scenario": name,
+            "Conventional kWh": round(b["total_kwh"], 2),
+            "Digital twin kWh": round(d["total_kwh"], 2),
+            "Saved %": round(r["saved_pct"], 1),
+            "Saved % (HVAC+light)": round(r["controllable_saved_pct"], 1),
+            "Saved % (stored-heat adj.)": round(r["adjusted_saved_pct"], 1),
+            "Comfort-violation min (conv.)": b["violation_min"],
+            "Comfort-violation min (DT)": d["violation_min"],
+            "Twin MAE 5 min (°C)": round(d["mae_5min"], 3),
+            f"Twin MAE {horizon} min (°C)": round(d[f"mae_{horizon}min"], 3),
         })
+    return pd.DataFrame(rows)
 
-    hours = STEP_MINUTES / 60
-    s.kwh_normal += total_normal_kw * hours
-    s.kwh_dt += total_dt_kw * hours
 
-    s.history.append({
-        "t": s.t, "normal_kw": total_normal_kw, "dt_kw": total_dt_kw,
-        "humidity": s.humidity, "outside_temp": outside_temp,
-        "zones": zone_rows,
-    })
-    s.history = s.history[-200:]  # cap history
-    s.t += 1
+def fmt_time(minute):
+    m = int(minute) % 1440
+    return f"{m // 60:02d}:{m % 60:02d}"
 
-# manual single step always available
-manual_step = st.sidebar.button("⏭ Step once")
-if manual_step:
-    step()
 
-# --------------------------------------------------------------------
-# Header
-# --------------------------------------------------------------------
-st.title("🏢 Digital Twin — Smart Building Energy Dashboard")
-st.caption("Digital Twin predicts zone conditions and drives a predictive BEMS (DT-BEMS), "
-           "compared live against a conventional reactive BEMS.")
+# --------------------------------------------------------------------------
+# Sidebar
+# --------------------------------------------------------------------------
+sb = st.sidebar
+sb.title("Controls")
+sb.selectbox("Scenario", list(SCENARIOS), key="scenario")
+sb.caption(SCENARIOS[st.session_state.scenario]().description)
+sb.slider("Outdoor temperature offset (°C)", -5.0, 8.0, step=0.5, key="out_off")
+sb.slider("Indoor starting temperature offset (°C)", -2.0, 5.0, step=0.5, key="start_off")
+sb.markdown("**Occupancy multiplier per zone**")
+sb.slider(ZN[0], 0.0, 2.0, step=0.25, key="m0")
+sb.slider(ZN[1], 0.0, 2.0, step=0.25, key="m1")
+sb.slider(ZN[2], 0.0, 2.0, step=0.25, key="m2")
+sb.select_slider("Prediction horizon (min)", options=[15, 30, 45], key="horizon")
+sb.number_input("Electricity tariff (₹/kWh)", 1.0, 30.0, step=0.5, key="tariff")
 
-if not st.session_state.history:
-    step()
+sb.markdown("**Quick presets**")
+c1, c2 = sb.columns(2)
+c1.button("Heatwave", on_click=preset,
+          kwargs=dict(scenario="Heatwave", out_off=0.0), width="stretch")
+c2.button("Empty meeting room", on_click=preset, kwargs=dict(m1=0.0), width="stretch")
+c3, c4 = sb.columns(2)
+c3.button("Full occupancy", on_click=preset, kwargs=dict(m0=1.5, m1=1.5, m2=1.5), width="stretch")
+c4.button("Reset all", on_click=preset, kwargs=DEFAULTS, width="stretch")
+sb.caption("Both controllers always replay the identical weather and occupancy.")
 
-latest = st.session_state.history[-1]
-zdf = pd.DataFrame(latest["zones"])
+# --------------------------------------------------------------------------
+# Run
+# --------------------------------------------------------------------------
+S = st.session_state
+scenario, res = run_scenario(
+    S.scenario, S.out_off, S.start_off, (S.m0, S.m1, S.m2), S.horizon)
+base, dt = res["baseline"], res["dt"]
+bl, dl = base.log, dt.log
+bs, ds = base.summary, dt.summary
+horizon = S.horizon
+tariff = S.tariff
 
-normal_now = latest["normal_kw"]
-dt_now = latest["dt_kw"]
-saved_now = normal_now - dt_now
-reduction_pct = (saved_now / normal_now * 100) if normal_now > 0 else 0
+st.title("Digital Twin Building Energy Management (DT-BEMS)")
+st.caption("A conventional reactive BEMS vs a digital-twin predictive controller, "
+           "run on identical simulated conditions. Modelled results with illustrative "
+           "parameters; real savings need validation against actual building data.")
 
-# --------------------------------------------------------------------
-# Top metrics
-# --------------------------------------------------------------------
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Normal BEMS", f"{normal_now:.2f} kW")
-m2.metric("DT-BEMS", f"{dt_now:.2f} kW", delta=f"-{reduction_pct:.1f}%")
-m3.metric("Energy saved (now)", f"{saved_now:.2f} kW")
-m4.metric("Cumulative cost saved", f"₹{(st.session_state.kwh_normal - st.session_state.kwh_dt) * price:,.1f}")
-co2_saved = (st.session_state.kwh_normal - st.session_state.kwh_dt) * CO2_FACTOR
-m5.metric("CO₂ avoided", f"{co2_saved:.2f} kg")
+# KPI row -------------------------------------------------------------------
+saved_kwh = bs["total_kwh"] - ds["total_kwh"]
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Energy: conventional", f"{bs['total_kwh']:.1f} kWh")
+k2.metric("Energy: digital twin", f"{ds['total_kwh']:.1f} kWh",
+          delta=f"{-res['saved_pct']:.1f}%", delta_color="inverse")
+k3.metric("Cost saved", f"₹{saved_kwh * tariff:,.0f}")
+k4.metric("Comfort violations (min)", f"{ds['violation_min']}",
+          delta=f"{ds['violation_min'] - bs['violation_min']} vs conv.", delta_color="inverse")
+k5.metric(f"Twin MAE ({horizon} min)", f"{ds[f'mae_{horizon}min']:.2f} °C")
 
-st.divider()
+# Time selector -------------------------------------------------------------
+options = list(range(0, scenario.steps, INTERVAL))
+label = lambda k: fmt_time(scenario.start_minute + k)
+k_sel = st.select_slider(
+    "Time of day (inspect the building and the optimiser at this moment)",
+    options=options, value=options[len(options) // 4], format_func=label,
+    key=f"time_{S.scenario}_{scenario.steps}")
+minute = (scenario.start_minute + k_sel) % 1440
 
-# --------------------------------------------------------------------
-# Zone table + gauges
-# --------------------------------------------------------------------
-left, right = st.columns([1.3, 1])
+tabs = st.tabs(["Building", "Digital twin", "Energy", "Optimiser", "Impact", "All scenarios"])
 
-with left:
-    st.subheader("📊 Live energy comparison")
-    hist_df = pd.DataFrame(st.session_state.history)
+# --------------------------------------------------------------------------
+# Tab: building overview
+# --------------------------------------------------------------------------
+with tabs[0]:
+    b_now = bl[bl.k == k_sel].set_index("zone")
+    d_now = dl[dl.k == k_sel].set_index("zone")
+    st.subheader(f"Building at {label(k_sel)}")
+    a, b_, c = st.columns(3)
+    a.metric("Outdoor temperature", f"{d_now.t_out.iloc[0]:.1f} °C")
+    b_.metric("Building power: conventional", f"{b_now.total_w.sum() / 1000:.2f} kW")
+    c.metric("Building power: digital twin", f"{d_now.total_w.sum() / 1000:.2f} kW")
+    rows = []
+    for z in range(3):
+        rows.append({
+            "Zone": ZN[z], "Occupancy": int(d_now.occ[z]),
+            "Temp conv. (°C)": round(b_now["T"][z], 2),
+            "Temp DT (°C)": round(d_now["T"][z], 2),
+            "HVAC conv.": b_now.hvac_mode[z], "HVAC DT": d_now.hvac_mode[z],
+            "Lights conv.": "ON" if b_now.light_on[z] else "OFF",
+            "Lights DT": "ON" if d_now.light_on[z] else "OFF",
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption("Comfort band while occupied: 22-26 °C. Humidity is not modelled in this version.")
+
+# --------------------------------------------------------------------------
+# Tab: digital twin
+# --------------------------------------------------------------------------
+with tabs[1]:
+    z_sel = st.selectbox("Zone", range(3), format_func=lambda i: ZN[i], key="z_twin")
+    zb = bl[bl.zone == z_sel]
+    zd = dl[dl.zone == z_sel]
+    pred = dt.predictions
+    pred = pred[(pred.zone == z_sel) & (pred.label == f"{horizon}min")]
+    hx = lambda k: (scenario.start_minute + k) / 60.0
+
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=hist_df["t"], y=hist_df["normal_kw"], name="Normal BEMS",
-                              mode="lines", line=dict(color="#d9534f", width=2)))
-    fig.add_trace(go.Scatter(x=hist_df["t"], y=hist_df["dt_kw"], name="DT-BEMS",
-                              mode="lines", line=dict(color="#5cb85c", width=2)))
-    fig.update_layout(xaxis_title="time step", yaxis_title="Power (kW)",
-                       height=380, margin=dict(l=10, r=10, t=10, b=10),
-                       legend=dict(orientation="h", yanchor="bottom", y=1.02))
-    st.plotly_chart(fig, use_container_width=True)
+    fig.add_hrect(y0=ZONES[z_sel].comfort_min, y1=ZONES[z_sel].comfort_max,
+                  fillcolor="#2CA02C", opacity=0.10, line_width=0,
+                  annotation_text="comfort band", annotation_position="top left")
+    fig.add_trace(go.Scatter(x=hx(zb.k), y=zb["T"], name="Conventional (actual)",
+                             line=dict(color=C_BASE, width=2)))
+    fig.add_trace(go.Scatter(x=hx(zd.k), y=zd["T"], name="Digital twin (actual)",
+                             line=dict(color=C_DT, width=2)))
+    fig.add_trace(go.Scatter(x=hx(pred.target), y=pred.predicted,
+                             name=f"Twin prediction ({horizon} min ahead)",
+                             mode="lines", line=dict(color=C_DT, width=1.5, dash="dot")))
+    fig.add_vline(x=hx(k_sel), line_dash="dash", line_color="gray")
+    fig.update_layout(height=380, xaxis_title="Hour of day", yaxis_title="Temperature (°C)",
+                      margin=dict(l=10, r=10, t=30, b=10),
+                      legend=dict(orientation="h", y=1.12))
+    st.plotly_chart(fig, width="stretch")
 
-with right:
-    st.subheader("🧠 Digital Twin — zone state")
-    st.dataframe(
-        zdf.rename(columns={
-            "zone": "Zone", "temp": "Temp °C", "occupancy": "Occupancy",
-            "predicted_temp": "Predicted °C", "hvac_normal": "HVAC Normal (kW)",
-            "hvac_dt": "HVAC DT (kW)"
-        }),
-        hide_index=True, use_container_width=True
-    )
-    st.metric("Outside temperature", f"{outside_temp:.1f} °C")
-    st.metric("Building humidity", f"{latest['humidity']:.1f} %")
-    st.metric("Active controller", active_mode)
+    m1_, m2_, m3_ = st.columns(3)
+    m1_.metric("MAE 5 min ahead (all zones)", f"{ds['mae_5min']:.3f} °C")
+    m2_.metric(f"MAE {horizon} min ahead (all zones)", f"{ds[f'mae_{horizon}min']:.3f} °C")
+    zone_mae = dt.predictions
+    zone_mae = zone_mae[(zone_mae.zone == z_sel) & (zone_mae.label == f"{horizon}min")].abs_error.mean()
+    m3_.metric(f"MAE {horizon} min, this zone", f"{zone_mae:.3f} °C")
+    st.caption(f"The {horizon}-minute prediction assumes the chosen plan is held, but the "
+               "controller re-plans every 5 minutes, so part of that error comes from changed "
+               "decisions and not only model error. The twin deliberately uses slightly wrong "
+               "building parameters (UA +10%, C -5%).")
 
-st.divider()
-st.subheader("💡 Cumulative energy & cost")
-c1, c2, c3 = st.columns(3)
-c1.metric("Total kWh — Normal BEMS", f"{st.session_state.kwh_normal:.2f} kWh")
-c2.metric("Total kWh — DT-BEMS", f"{st.session_state.kwh_dt:.2f} kWh")
-c3.metric("Overall reduction", f"{(1 - st.session_state.kwh_dt / st.session_state.kwh_normal) * 100:.1f} %"
-          if st.session_state.kwh_normal > 0 else "0 %")
+    tw = DigitalTwin(ZONES, horizon=horizon)
+    occ_rows = []
+    for z in range(3):
+        now_occ = int(dl[(dl.k == k_sel) & (dl.zone == z)].occ.iloc[0])
+        occ_rows.append({"Zone": ZN[z], "Occupancy now": now_occ,
+                         f"Predicted in {horizon} min": tw.predict_occupancy(z, minute, now_occ, horizon)[-1]})
+    st.markdown(f"**Occupancy prediction from {label(k_sel)}** (schedule-based estimate)")
+    st.dataframe(pd.DataFrame(occ_rows), hide_index=True, width="stretch")
 
-st.caption("Normal BEMS reacts only to the current temperature. DT-BEMS uses the Digital Twin's "
-           "short-horizon prediction plus live occupancy to pre-cool/heat gently, set back HVAC in "
-           "empty zones, and dim lighting proportionally to occupancy — this is what drives the "
-           "energy savings shown above.")
+# --------------------------------------------------------------------------
+# Tab: energy comparison
+# --------------------------------------------------------------------------
+with tabs[2]:
+    pb = bl.groupby("k").total_w.sum() / 1000
+    pd_ = dl.groupby("k").total_w.sum() / 1000
+    x = (scenario.start_minute + pb.index) / 60.0
+    f1 = go.Figure()
+    f1.add_trace(go.Scatter(x=x, y=pb.values, name="Conventional", line=dict(color=C_BASE)))
+    f1.add_trace(go.Scatter(x=x, y=pd_.values, name="Digital twin", line=dict(color=C_DT)))
+    f1.add_vline(x=hx(k_sel), line_dash="dash", line_color="gray")
+    f1.update_layout(height=320, xaxis_title="Hour of day", yaxis_title="Building power (kW)",
+                     margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=1.1))
+    st.plotly_chart(f1, width="stretch")
 
-# --------------------------------------------------------------------
-# Auto-run loop
-# --------------------------------------------------------------------
-if st.session_state.running:
-    time.sleep(speed)
-    step()
-    st.rerun()
+    f2 = go.Figure()
+    f2.add_trace(go.Scatter(x=x, y=(pb / 60).cumsum().values, name="Conventional",
+                            line=dict(color=C_BASE)))
+    f2.add_trace(go.Scatter(x=x, y=(pd_ / 60).cumsum().values, name="Digital twin",
+                            line=dict(color=C_DT)))
+    f2.update_layout(height=300, xaxis_title="Hour of day", yaxis_title="Cumulative energy (kWh)",
+                     margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=1.1))
+    st.plotly_chart(f2, width="stretch")
+
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("Energy saved", f"{saved_kwh:.2f} kWh")
+    e2.metric("Reduction (total)", f"{res['saved_pct']:.1f} %")
+    e3.metric("Reduction (HVAC + lighting only)", f"{res['controllable_saved_pct']:.1f} %")
+    e4.metric("Reduction (adjusted for stored heat)", f"{res['adjusted_saved_pct']:.1f} %")
+    st.caption("Total includes equipment load, which neither controller can change. The adjusted "
+               "figure accounts for rooms ending warmer than they started, which would otherwise "
+               "look like savings but is just deferred cooling.")
+
+# --------------------------------------------------------------------------
+# Tab: optimiser
+# --------------------------------------------------------------------------
+with tabs[3]:
+    z_opt = st.selectbox("Zone", range(3), format_func=lambda i: ZN[i], key="z_opt")
+    kp = (k_sel // INTERVAL) * INTERVAL
+    plans = dt.plans
+    cand = plans[(plans.k == kp) & (plans.zone == z_opt)].copy()
+    chosen = cand[cand.chosen].iloc[0]
+    n_rej = int((~cand.feasible).sum())
+    st.markdown(
+        f"**Decision at {label(kp)} for {ZN[z_opt]}:** plan `{chosen.plan}` "
+        f"-> apply **{chosen.first_mode}** for the next {INTERVAL} min. "
+        f"{len(cand)} plans evaluated, {n_rej} rejected, "
+        f"{len(cand) - n_rej} feasible.")
+    cand = cand.sort_values(["chosen", "feasible", "energy_kwh"],
+                            ascending=[False, False, True])
+    show = cand.rename(columns={
+        "plan": "Plan (3 x 10 min)", "first_mode": "First action",
+        "min_temp": "Min temp (°C)", "max_temp": "Max temp (°C)",
+        "energy_kwh": "Energy (kWh)", "feasible": "Feasible",
+        "reason": "Reason", "chosen": "Chosen"})[
+        ["Chosen", "Plan (3 x 10 min)", "First action", "Min temp (°C)",
+         "Max temp (°C)", "Energy (kWh)", "Feasible", "Reason"]]
+    styled = (show.style
+              .format({"Min temp (°C)": "{:.2f}", "Max temp (°C)": "{:.2f}",
+                       "Energy (kWh)": "{:.3f}"})
+              .apply(lambda r: ["background-color: rgba(31,119,180,0.18)" if r["Chosen"] else ""
+                                for _ in r], axis=1))
+    st.dataframe(styled, hide_index=True, width="stretch", height=420)
+    st.caption("Each plan is simulated with the twin. Plans leaving the comfort band "
+               "(with a 0.3 °C safety margin) are rejected; the lowest-cost feasible plan wins, "
+               "including a small penalty for switching and for leaving stored heat at the end.")
+
+# --------------------------------------------------------------------------
+# Tab: environmental / cost impact
+# --------------------------------------------------------------------------
+with tabs[4]:
+    def runtime(log, mode=None):
+        on = (log.hvac_mode != "OFF") if mode is None else (log.hvac_mode == mode)
+        return on.mean() * 100
+
+    imp = pd.DataFrame({
+        "Metric": ["Energy (kWh)", "Electricity cost (₹)", "CO₂ (kg)",
+                   "Comfort-violation minutes", "Degree-minutes outside comfort",
+                   "Peak building power (kW)", "HVAC running (% of zone-minutes)",
+                   "HVAC on HIGH (% of zone-minutes)"],
+        "Conventional": [bs["total_kwh"], bs["total_kwh"] * tariff, bs["total_kwh"] * CO2_FACTOR,
+                         bs["violation_min"], bs["violation_degmin"], bs["peak_kw"],
+                         runtime(bl), runtime(bl, "HIGH")],
+        "Digital twin": [ds["total_kwh"], ds["total_kwh"] * tariff, ds["total_kwh"] * CO2_FACTOR,
+                         ds["violation_min"], ds["violation_degmin"], ds["peak_kw"],
+                         runtime(dl), runtime(dl, "HIGH")],
+    })
+    imp["Difference (DT - conv.)"] = imp["Digital twin"] - imp["Conventional"]
+    st.dataframe(imp.style.format({"Conventional": "{:.2f}", "Digital twin": "{:.2f}",
+                                   "Difference (DT - conv.)": "{:+.2f}"}),
+                 hide_index=True, width="stretch")
+    st.caption(f"CO₂ uses {CO2_FACTOR} kg/kWh (approximate grid average; replace with a documented "
+               "figure for your intended scenario). Tariff is set in the sidebar.")
+
+# --------------------------------------------------------------------------
+# Tab: all scenarios
+# --------------------------------------------------------------------------
+with tabs[5]:
+    st.markdown("**All five predefined scenarios** (default sliders, current horizon)")
+    st.dataframe(run_all(horizon), hide_index=True, width="stretch")
+    st.caption("Evidence table for the demo. Expected behaviours are test objectives, not "
+               "guaranteed savings; report any scenario where the twin does worse.")
