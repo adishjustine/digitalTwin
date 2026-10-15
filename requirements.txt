@@ -2,4 +2,5 @@ streamlit>=1.50
 pandas
 numpy
 plotly
+paho-mqtt>=2.0
 pytest

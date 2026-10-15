@@ -37,8 +37,25 @@ simulation/
   scenarios.py             Five seeded scenarios (fixed weather/occupancy tables)
   controllers.py           Conventional and digital-twin controllers
   simulator.py             Runs a controller; compares two fairly
+integration/               MQTT bridge, live session, protocol, fake ESP32
+wokwi/                     ESP32 firmware, circuit (diagram.json), setup guide
 tests/test_core.py         Empty building, high temp, occupancy, fairness, MAE
+tests/test_live.py         Protocol, validation, live loop vs offline simulator
 data/results.csv           Output of run_experiments.py
+```
+
+## Hardware-in-the-loop with Wokwi
+
+An ESP32 simulated in Wokwi acts as the physical layer (DHT22, occupancy
+potentiometers, LEDs). It exchanges MQTT messages with `integration/mqtt_bridge.py`,
+which runs the digital twin and optimiser and sends back HVAC/lighting commands.
+Setup, pin map and protocol: see [`wokwi/README.md`](wokwi/README.md).
+
+```bash
+python -m integration.mqtt_bridge --site-id <your-unique-id>
+python -m integration.fake_device --mqtt --scenario "Heatwave"   # same loop without Wokwi
+python wokwi/host_test/check_firmware.py                         # firmware logic vs Python
+python tests/test_live.py
 ```
 
 ## Model in brief

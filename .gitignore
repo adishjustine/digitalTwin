@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+# live-session output written by the MQTT bridge
+data/live_state.json
+data/live_log.csv
+data/*.tmp

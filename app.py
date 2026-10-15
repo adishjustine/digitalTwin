@@ -8,6 +8,9 @@ All results are modelled with illustrative parameters. They are not
 measurements of a real building.
 """
 import dataclasses
+import json
+import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -105,7 +108,8 @@ c2.button("Empty meeting room", on_click=preset, kwargs=dict(m1=0.0), width="str
 c3, c4 = sb.columns(2)
 c3.button("Full occupancy", on_click=preset, kwargs=dict(m0=1.5, m1=1.5, m2=1.5), width="stretch")
 c4.button("Reset all", on_click=preset, kwargs=DEFAULTS, width="stretch")
-sb.caption("Both controllers always replay the identical weather and occupancy.")
+sb.caption("Both controllers always replay the identical weather and occupancy. "
+           "These controls affect the offline tabs only; the Live tab follows Wokwi.")
 
 # --------------------------------------------------------------------------
 # Run
@@ -144,7 +148,8 @@ k_sel = st.select_slider(
     key=f"time_{S.scenario}_{scenario.steps}")
 minute = (scenario.start_minute + k_sel) % 1440
 
-tabs = st.tabs(["Building", "Digital twin", "Energy", "Optimiser", "Impact", "All scenarios"])
+tabs = st.tabs(["Building", "Digital twin", "Energy", "Optimiser", "Impact",
+                "All scenarios", "Live hardware (Wokwi)"])
 
 # --------------------------------------------------------------------------
 # Tab: building overview
@@ -197,6 +202,17 @@ with tabs[1]:
                       margin=dict(l=10, r=10, t=30, b=10),
                       legend=dict(orientation="h", y=1.12))
     st.plotly_chart(fig, width="stretch")
+
+    pw = go.Figure()
+    for lg_, nm, col in ((zb, "Conventional", C_BASE), (zd, "Digital twin", C_DT)):
+        pw.add_trace(go.Scatter(x=hx(lg_.k), y=lg_.hvac_w / 1000.0, name=f"{nm} HVAC power",
+                                line=dict(color=col, width=1.5, shape="hv")))
+    pw.add_vline(x=hx(k_sel), line_dash="dash", line_color="gray")
+    pw.update_layout(height=230, xaxis_title="Hour of day", yaxis_title="HVAC power (kW)",
+                     margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=1.15))
+    st.plotly_chart(pw, width="stretch")
+    st.caption("Temperatures are held near the setpoint by design, so slider changes show up "
+               "mainly here and in the Energy tab, as more or less HVAC power.")
 
     m1_, m2_, m3_ = st.columns(3)
     m1_.metric("MAE 5 min ahead (all zones)", f"{ds['mae_5min']:.3f} °C")
@@ -320,3 +336,109 @@ with tabs[5]:
     st.dataframe(run_all(horizon), hide_index=True, width="stretch")
     st.caption("Evidence table for the demo. Expected behaviours are test objectives, not "
                "guaranteed savings; report any scenario where the twin does worse.")
+
+# --------------------------------------------------------------------------
+# Tab: live hardware (Wokwi ESP32 -> MQTT -> bridge -> twin -> optimiser)
+# --------------------------------------------------------------------------
+_DATA = Path(__file__).resolve().parent / "data"
+LIVE_STATE = _DATA / "live_state.json"
+LIVE_LOG = _DATA / "live_log.csv"
+
+
+@st.fragment(run_every="2s")
+def live_panel():
+    if not LIVE_STATE.exists():
+        st.info(
+            "No live data yet. Start the bridge in a terminal:\n\n"
+            "`python -m integration.mqtt_bridge`\n\n"
+            "then press Play on the Wokwi project (see wokwi/README.md). "
+            "No Wokwi? Test the same path with "
+            "`python -m integration.fake_device --mqtt --scenario \"Heatwave\"`.")
+        return
+    try:
+        state = json.loads(LIVE_STATE.read_text())
+    except (OSError, ValueError):
+        st.caption("Reading live data...")
+        return
+
+    age = time.time() - state["updated"]
+    h = state["horizon"]
+    st.markdown(
+        f"**Simulated time {fmt_time(state['minute'])}** (tick {state['k']}). "
+        + (f":green[receiving data, last update {age:.0f}s ago]" if age < 15
+           else f":orange[no update for {age:.0f}s. Is the ESP32 running and the bridge connected?]"))
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Outdoor (DHT22)", f"{state['t_out']:.1f} °C")
+    c2.metric("Humidity", "n/a" if state["hum"] is None else f"{state['hum']:.0f} %")
+    c3.metric("Energy so far", f"{state['kwh']:.2f} kWh")
+    c4.metric("Minutes outside comfort", state["violation_min"])
+    mae = state.get(f"mae_{h}min")
+    c5.metric(f"Twin MAE {h} min", "n/a" if mae is None else f"{mae:.2f} °C")
+
+    zrows = [{"Zone": z["name"], "Sensor temp (°C)": z["T"], "Twin estimate (°C)": z["T_est"],
+              "Occupancy": z["occ"], "HVAC": z["mode"], "Lights": "ON" if z["light"] else "OFF",
+              "Power (W)": z["power_w"],
+              "Plans feasible": f"{z['n_feasible']}/{z['n_candidates']}"}
+             for z in state["zones"]]
+    st.dataframe(pd.DataFrame(zrows), hide_index=True, width="stretch")
+
+    try:
+        log = pd.read_csv(LIVE_LOG)
+    except (OSError, ValueError, pd.errors.EmptyDataError):
+        log = pd.DataFrame()
+    if not log.empty:
+        from plotly.subplots import make_subplots
+        x0 = log.minute.iloc[0] - log.k.iloc[0]
+        log = log.assign(hour=(x0 + log.k) / 60.0)          # continuous simulated hours
+        recent = log[log.k > log.k.max() - 240]
+        zone_names = sorted(recent.zone_name.unique())
+        colors = ["#1F77B4", "#E07B00", "#9467BD"]
+        fig = make_subplots(
+            rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+            subplot_titles=("Sensor temperature (°C): the controlled variable, held in the band",
+                            "HVAC electrical power (kW): where the controller's response shows",
+                            "Occupancy (people), set by the Wokwi potentiometers",
+                            "Outdoor temperature (°C), set by the Wokwi DHT22"))
+        fig.add_hrect(y0=22, y1=26, fillcolor="#2CA02C", opacity=0.10, line_width=0, row=1, col=1)
+        for zi, name in enumerate(zone_names):
+            zz = recent[recent.zone_name == name]
+            col = colors[zi % 3]
+            fig.add_trace(go.Scatter(x=zz.hour, y=zz["T"], name=name, mode="lines",
+                                     line=dict(color=col), legendgroup=name), row=1, col=1)
+            power = zz["hvac_w"] / 1000.0 if "hvac_w" in zz else zz["total_w"] / 1000.0
+            fig.add_trace(go.Scatter(x=zz.hour, y=power, name=name, mode="lines",
+                                     line=dict(color=col, shape="hv"), legendgroup=name,
+                                     showlegend=False), row=2, col=1)
+            fig.add_trace(go.Scatter(x=zz.hour, y=zz.occ, name=name, mode="lines",
+                                     line=dict(color=col, shape="hv"), legendgroup=name,
+                                     showlegend=False), row=3, col=1)
+        one = recent[recent.zone_name == zone_names[0]]
+        fig.add_trace(go.Scatter(x=one.hour, y=one.t_out, name="Outdoor", mode="lines",
+                                 line=dict(color="#555555"), showlegend=False), row=4, col=1)
+        fig.update_xaxes(title_text="Simulated hour of day", row=4, col=1)
+        fig.update_layout(height=760, margin=dict(l=10, r=10, t=40, b=10),
+                          legend=dict(orientation="h", y=1.06))
+        st.plotly_chart(fig, width="stretch")
+        st.caption("Why the temperature line looks calm: the twin's job is to keep it inside the "
+                   "22-26 °C band, so a disturbance (hotter outside, more people) shows up as "
+                   "more HVAC power, not as a different temperature. Watch the second panel.")
+
+    zsel = st.selectbox("Latest optimiser decision for", range(len(state["zones"])),
+                        format_func=lambda i: state["zones"][i]["name"], key="z_live")
+    cands = state["zones"][zsel]["candidates"]
+    if cands:
+        st.caption("Top 12 of the plans evaluated at the latest 5-minute re-plan "
+                   "(chosen first, then feasible by energy).")
+        st.dataframe(pd.DataFrame(cands).rename(columns={
+            "plan": "Plan", "first_mode": "First action", "min_temp": "Min °C",
+            "max_temp": "Max °C", "energy_kwh": "kWh", "feasible": "Feasible",
+            "reason": "Reason", "chosen": "Chosen"}), hide_index=True, width="stretch")
+    st.caption("The sidebar sliders and presets only affect the offline tabs. The live view is driven "
+               "by Wokwi: DHT22 = outdoor temperature, the three potentiometers = occupancy. "
+               "Live mode shows the digital-twin controller acting on the (simulated) hardware. "
+               "The fair side-by-side energy comparison is the offline simulator in the other tabs, "
+               "because a conventional controller cannot be run on the same physical history here.")
+
+
+with tabs[6]:
+    live_panel()
